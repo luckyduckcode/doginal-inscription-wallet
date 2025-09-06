@@ -1,0 +1,18 @@
+{
+  "wallet": {
+    "taxWalletAddress": "DSdmMg7Mrmdm2dWL4fwmuPpFf1YVDfLzVv",
+    "taxAmount": 2.0,
+    "defaultFeeRate": 1000,
+    "maxInscriptionSize": 400000
+  },
+  "network": {
+    "defaultElectrumServer": "electrum.dogecoin.com",
+    "defaultPort": 50001,
+    "explorerUrl": "https://dogechain.info/tx/"
+  },
+  "ui": {
+    "appTitle": "Doginal Inscription Wallet",
+    "theme": "dark",
+    "autoRefreshInterval": 30000
+  }
+}

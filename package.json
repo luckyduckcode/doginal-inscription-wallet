@@ -1,0 +1,190 @@
+{
+  "name": "doginal-inscription-wallet",
+  "version": "1.0.0",
+  "description": "A Doginal inscription wallet with GUI that utilizes Doge-Electrum for managing Dogecoin transactions and creating inscriptions.",
+  "main": "electron/main.js",
+  "homepage": "./",
+  "scripts": {
+    "start": "npm run electron:dev",
+    "dev": "npm run electron:dev",
+    "electron:dev": "concurrently \"npm run react:dev\" \"wait-on http://localhost:3000 && electron .\"",
+    "react:dev": "cross-env BROWSER=none react-scripts start",
+    "build": "npm run build:react && npm run build:electron",
+    "build:react": "cross-env NODE_ENV=production react-scripts build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:prod": "npm run clean && npm run build",
+    "build:organized": "npx tsc && npx electron-builder --dir --config.directories.output=dist-organized",
+    "electron:pack": "electron-builder",
+    "electron:dist": "electron-builder --publish=never",
+    "preelectron:pack": "npm run build:prod",
+    "preelectron:dist": "npm run build:prod",
+    "test": "react-scripts test --watchAll=false",
+    "test:watch": "react-scripts test",
+    "test:coverage": "react-scripts test --coverage --watchAll=false",
+    "clean": "rimraf build dist node_modules/.cache",
+    "clean:all": "rimraf build dist* node_modules/.cache archive-old-files",
+    "postinstall": "electron-builder install-app-deps",
+    "release": "npm run build:prod && electron-builder --publish=always",
+    "release:github": "npm run build:prod && electron-builder --publish=github",
+    "pack:win": "npm run kill-processes && npm run build:prod && electron-builder --win",
+    "kill-processes": "taskkill /f /im Doginal-Wallet.exe /t 2>nul || echo No processes to kill",
+    "pack:mac": "npm run build:prod && electron-builder --mac",
+    "pack:linux": "npm run build:prod && electron-builder --linux",
+    "quick-start": "echo Starting Doginal Wallet... && npm run electron:dev",
+    "setup": "npm install && npm run build:electron",
+    "package": "npm run build:prod && npm run electron:pack",
+    "lint": "eslint src/**/*.{js,jsx,ts,tsx}",
+    "lint:fix": "eslint src/**/*.{js,jsx,ts,tsx} --fix",
+    "analyze": "npm run build:react && npx bundle-analyzer build/static/js/*.js"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "base58check": "^2.0.0",
+    "bip32": "^5.0.0-rc.0",
+    "bip39": "^3.1.0",
+    "bitcoinjs-lib": "^6.1.0",
+    "buffer": "^6.0.3",
+    "crypto-browserify": "^3.12.0",
+    "ecpair": "^3.0.0",
+    "electron-is-dev": "^2.0.0",
+    "electron-log": "^4.4.8",
+    "electron-updater": "^6.1.1",
+    "electrum-client": "^0.0.6",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "stream-browserify": "^3.0.0",
+    "tiny-secp256k1": "^2.2.4",
+    "wif": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.16.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@typescript-eslint/eslint-plugin": "^6.2.0",
+    "@typescript-eslint/parser": "^6.2.0",
+    "concurrently": "^8.2.0",
+    "cross-env": "^7.0.3",
+    "electron": "^22.3.27",
+    "electron-builder": "^24.6.3",
+    "eslint": "^8.45.0",
+    "eslint-plugin-react": "^7.33.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "rimraf": "^5.0.1",
+    "typescript": "^5.9.2",
+    "wait-on": "^7.0.1"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "author": "Your Name",
+  "license": "MIT",
+  "build": {
+    "appId": "com.doginalwallet.inscription",
+    "productName": "Doginal Inscription Wallet",
+    "copyright": "Copyright © 2025 Doginal Wallet Team",
+    "directories": {
+      "output": "dist-new"
+    },
+    "files": [
+      "build/**/*",
+      "electron/**/*",
+      "dist/electron/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": false,
+      "publisherName": "Doginal Wallet Team",
+      "verifyUpdateCodeSignature": false,
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": false,
+      "category": "public.app-category.finance",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "rpm",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": false,
+      "category": "Office"
+    },
+    "dmg": {
+      "title": "Doginal Inscription Wallet",
+      "window": {
+        "width": 540,
+        "height": 380
+      }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "doginal-wallet",
+        "repo": "inscription-wallet",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

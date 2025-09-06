@@ -1,0 +1,29 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const jsx_runtime_1 = require("react/jsx-runtime");
+const react_1 = require("react");
+const FundingGuide = ({ walletAddress, onComplete, onSkip }) => {
+    const [step, setStep] = (0, react_1.useState)(1);
+    const copyAddress = () => {
+        navigator.clipboard.writeText(walletAddress).then(() => {
+            alert('✅ Address copied! Send DOGE to this address.');
+        }).catch(() => {
+            alert('❌ Failed to copy. Please copy manually.');
+        });
+    };
+    const nextStep = () => {
+        if (step < 4) {
+            setStep(step + 1);
+        }
+        else {
+            onComplete();
+        }
+    };
+    const prevStep = () => {
+        if (step > 1) {
+            setStep(step - 1);
+        }
+    };
+    return ((0, jsx_runtime_1.jsx)("div", { className: "funding-guide", children: (0, jsx_runtime_1.jsxs)("div", { className: "funding-modal", children: [(0, jsx_runtime_1.jsxs)("div", { className: "funding-header", children: [(0, jsx_runtime_1.jsx)("h2", { children: "\uD83D\uDCB0 Fund Your Wallet" }), (0, jsx_runtime_1.jsx)("p", { children: "Follow these steps to add DOGE to your wallet" })] }), (0, jsx_runtime_1.jsxs)("div", { className: "funding-steps", children: [(0, jsx_runtime_1.jsx)("div", { className: "step-indicator", children: [1, 2, 3, 4].map(num => ((0, jsx_runtime_1.jsx)("div", { className: `step-dot ${step >= num ? 'active' : ''}`, children: num }, num))) }), step === 1 && ((0, jsx_runtime_1.jsxs)("div", { className: "funding-step", children: [(0, jsx_runtime_1.jsx)("div", { className: "step-icon", children: "\uD83D\uDCCB" }), (0, jsx_runtime_1.jsx)("h3", { children: "Copy Your Address" }), (0, jsx_runtime_1.jsx)("p", { children: "Your unique Dogecoin address:" }), (0, jsx_runtime_1.jsxs)("div", { className: "address-display", children: [(0, jsx_runtime_1.jsx)("code", { children: walletAddress }), (0, jsx_runtime_1.jsx)("button", { className: "copy-address-btn", onClick: copyAddress, children: "\uD83D\uDCCB Copy" })] }), (0, jsx_runtime_1.jsx)("p", { className: "step-note", children: "This address is safe to share - it only receives DOGE" })] })), step === 2 && ((0, jsx_runtime_1.jsxs)("div", { className: "funding-step", children: [(0, jsx_runtime_1.jsx)("div", { className: "step-icon", children: "\uD83C\uDFE6" }), (0, jsx_runtime_1.jsx)("h3", { children: "Choose Your Source" }), (0, jsx_runtime_1.jsxs)("div", { className: "funding-options", children: [(0, jsx_runtime_1.jsxs)("div", { className: "option", children: [(0, jsx_runtime_1.jsx)("span", { className: "option-icon", children: "\uD83D\uDCF1" }), (0, jsx_runtime_1.jsxs)("div", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Exchange" }), (0, jsx_runtime_1.jsx)("p", { children: "Binance, Coinbase, Kraken, etc." })] })] }), (0, jsx_runtime_1.jsxs)("div", { className: "option", children: [(0, jsx_runtime_1.jsx)("span", { className: "option-icon", children: "\uD83D\uDC5B" }), (0, jsx_runtime_1.jsxs)("div", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Another Wallet" }), (0, jsx_runtime_1.jsx)("p", { children: "Send from existing Dogecoin wallet" })] })] }), (0, jsx_runtime_1.jsxs)("div", { className: "option", children: [(0, jsx_runtime_1.jsx)("span", { className: "option-icon", children: "\uD83C\uDF81" }), (0, jsx_runtime_1.jsxs)("div", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Faucet" }), (0, jsx_runtime_1.jsx)("p", { children: "Get small amounts for testing" })] })] })] })] })), step === 3 && ((0, jsx_runtime_1.jsxs)("div", { className: "funding-step", children: [(0, jsx_runtime_1.jsx)("div", { className: "step-icon", children: "\uD83D\uDCB8" }), (0, jsx_runtime_1.jsx)("h3", { children: "Send DOGE" }), (0, jsx_runtime_1.jsxs)("div", { className: "amount-guide", children: [(0, jsx_runtime_1.jsxs)("div", { className: "amount-item", children: [(0, jsx_runtime_1.jsx)("span", { className: "amount-label", children: "Minimum for 1 inscription:" }), (0, jsx_runtime_1.jsx)("span", { className: "amount-value", children: "~2.002 DOGE" })] }), (0, jsx_runtime_1.jsxs)("div", { className: "amount-item", children: [(0, jsx_runtime_1.jsx)("span", { className: "amount-label", children: "Recommended:" }), (0, jsx_runtime_1.jsx)("span", { className: "amount-value", children: "5+ DOGE" })] })] }), (0, jsx_runtime_1.jsxs)("div", { className: "warning-box", children: [(0, jsx_runtime_1.jsx)("strong", { children: "\u26A0\uFE0F Important:" }), " Send only DOGE to this address. Sending other coins may result in permanent loss."] })] })), step === 4 && ((0, jsx_runtime_1.jsxs)("div", { className: "funding-step", children: [(0, jsx_runtime_1.jsx)("div", { className: "step-icon", children: "\u2705" }), (0, jsx_runtime_1.jsx)("h3", { children: "Confirm Transaction" }), (0, jsx_runtime_1.jsx)("p", { children: "After sending DOGE:" }), (0, jsx_runtime_1.jsxs)("ul", { className: "confirmation-steps", children: [(0, jsx_runtime_1.jsx)("li", { children: "Wait 1-5 minutes for confirmation" }), (0, jsx_runtime_1.jsx)("li", { children: "Click \"Refresh Balance\" in the dashboard" }), (0, jsx_runtime_1.jsx)("li", { children: "Your DOGE balance will appear" }), (0, jsx_runtime_1.jsx)("li", { children: "You're ready to create inscriptions! \uD83C\uDFA8" })] })] }))] }), (0, jsx_runtime_1.jsxs)("div", { className: "funding-actions", children: [step > 1 && ((0, jsx_runtime_1.jsx)("button", { className: "btn-secondary", onClick: prevStep, children: "\u2190 Back" })), (0, jsx_runtime_1.jsx)("div", { className: "action-spacer" }), (0, jsx_runtime_1.jsx)("button", { className: "btn-skip", onClick: onSkip, children: "Skip for Now" }), (0, jsx_runtime_1.jsx)("button", { className: "btn-primary", onClick: nextStep, children: step === 4 ? 'Done! 🎉' : 'Next →' })] })] }) }));
+};
+exports.default = FundingGuide;

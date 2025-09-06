@@ -1,0 +1,1042 @@
+import * as bitcoin from 'bitcoinjs-lib';
+import axios from 'axios';
+import * as crypto from 'crypto';
+import * as bip39 from 'bip39';
+import { WalletConfig, WalletBalance, WalletAddress, ElectrumTransaction } from '../types';
+
+// Import required modules
+import * as bip32 from 'bip32';
+import * as ecc from 'tiny-secp256k1';
+const ECPair = require('ecpair');
+
+// Create BIP32 factory with ECC library
+const bip32Factory = bip32.BIP32Factory(ecc);
+
+// Import the electrum client
+const ElectrumClient = require('electrum-client');
+
+interface APIEndpoint {
+    name: string;
+    url: string;
+    priority: number;
+    lastSuccess: number;
+    consecutiveFailures: number;
+    isHealthy: boolean;
+}
+
+interface CircuitBreaker {
+    failures: number;
+    lastFailureTime: number;
+    state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+}
+
+export class DogeElectrumWallet {
+    private electrumUrl: string = '';
+    private electrumPort: number = 50001;
+    private network: any;
+    private isConnected: boolean = false;
+    private walletSeed: string = '';
+    private walletAddresses: WalletAddress[] = [];
+    private electrumClient: any = null;
+    private privateKeys: { [address: string]: string } = {};
+
+    // Industry-standard API resilience features
+    private apiEndpoints: APIEndpoint[] = [
+        {
+            name: 'Trezor Blockbook',
+            url: 'https://doge1.trezor.io/api/v2',
+            priority: 1,
+            lastSuccess: 0,
+            consecutiveFailures: 0,
+            isHealthy: true
+        },
+        {
+            name: 'BlockCypher',
+            url: 'https://api.blockcypher.com/v1/doge/main',
+            priority: 2,
+            lastSuccess: 0,
+            consecutiveFailures: 0,
+            isHealthy: true
+        },
+        {
+            name: 'DogeChain.info',
+            url: 'https://dogechain.info/api/v1',
+            priority: 3,
+            lastSuccess: 0,
+            consecutiveFailures: 0,
+            isHealthy: true
+        }
+    ];
+
+    private circuitBreakers: { [key: string]: CircuitBreaker } = {};
+    private balanceCache: { [address: string]: { balance: WalletBalance; timestamp: number } } = {};
+    private readonly CACHE_TTL = 30000; // 30 seconds
+    private readonly CIRCUIT_BREAKER_THRESHOLD = 3;
+    private readonly CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+    private readonly MAX_RETRIES = 3;
+    private readonly RETRY_DELAYS = [1000, 2000, 5000]; // 1s, 2s, 5s
+
+    // Manual balance override for when APIs fail
+    private manualBalances: { [address: string]: number } = {};
+
+    constructor() {
+        // Dogecoin network parameters
+        this.network = {
+            messagePrefix: '\x19Dogecoin Signed Message:\n',
+            bech32: 'dc',
+            bip32: {
+                public: 0x02facafd,
+                private: 0x02fac398,
+            },
+            pubKeyHash: 0x1e,
+            scriptHash: 0x16,
+            wif: 0x9e,
+        };
+
+        // Initialize circuit breakers
+        this.apiEndpoints.forEach(endpoint => {
+            this.circuitBreakers[endpoint.name] = {
+                failures: 0,
+                lastFailureTime: 0,
+                state: 'CLOSED'
+            };
+        });
+    }
+
+    // Set manual balance for when APIs are down
+    setManualBalance(address: string, balance: number): void {
+        this.manualBalances[address] = balance;
+        console.log(`Manual balance set for ${address}: ${balance} DOGE`);
+    }
+
+    // Get manual balance if set
+    getManualBalance(address: string): number | null {
+        return this.manualBalances[address] || null;
+    }
+
+    // Clear manual balance
+    clearManualBalance(address: string): void {
+        delete this.manualBalances[address];
+    }
+
+    // Industry-standard retry mechanism with exponential backoff
+    private async retryWithBackoff<T>(
+        operation: () => Promise<T>,
+        maxRetries: number = this.MAX_RETRIES,
+        delays: number[] = this.RETRY_DELAYS
+    ): Promise<T> {
+        let lastError: Error;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await operation();
+            } catch (error) {
+                lastError = error as Error;
+
+                if (attempt < maxRetries) {
+                    const delay = delays[Math.min(attempt, delays.length - 1)];
+                    console.log(`Attempt ${attempt + 1} failed, retrying in ${delay}ms:`, error.message);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+        throw lastError!;
+    }
+
+    // Circuit breaker pattern implementation
+    private canExecute(endpointName: string): boolean {
+        const breaker = this.circuitBreakers[endpointName];
+        if (!breaker) return true;
+
+        const now = Date.now();
+
+        switch (breaker.state) {
+            case 'CLOSED':
+                return true;
+            case 'OPEN':
+                if (now - breaker.lastFailureTime > this.CIRCUIT_BREAKER_TIMEOUT) {
+                    breaker.state = 'HALF_OPEN';
+                    return true;
+                }
+                return false;
+            case 'HALF_OPEN':
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private recordSuccess(endpointName: string): void {
+        const breaker = this.circuitBreakers[endpointName];
+        if (breaker) {
+            breaker.failures = 0;
+            breaker.state = 'CLOSED';
+        }
+
+        // Update endpoint health
+        const endpoint = this.apiEndpoints.find(e => e.name === endpointName);
+        if (endpoint) {
+            endpoint.lastSuccess = Date.now();
+            endpoint.consecutiveFailures = 0;
+            endpoint.isHealthy = true;
+        }
+    }
+
+    private recordFailure(endpointName: string): void {
+        const breaker = this.circuitBreakers[endpointName];
+        if (breaker) {
+            breaker.failures++;
+            breaker.lastFailureTime = Date.now();
+
+            if (breaker.failures >= this.CIRCUIT_BREAKER_THRESHOLD) {
+                breaker.state = 'OPEN';
+            }
+        }
+
+        // Update endpoint health
+        const endpoint = this.apiEndpoints.find(e => e.name === endpointName);
+        if (endpoint) {
+            endpoint.consecutiveFailures++;
+            if (endpoint.consecutiveFailures >= this.CIRCUIT_BREAKER_THRESHOLD) {
+                endpoint.isHealthy = false;
+            }
+        }
+    }
+
+    async getBalance(address: string): Promise<WalletBalance> {
+        if (!this.isConnected || !this.electrumClient) {
+            throw new Error('Wallet not connected');
+        }
+
+        try {
+            // Try Trezor Blockbook API first (very reliable)
+            console.log('Trying Trezor Blockbook API for balance...');
+            const response = await axios.get(`https://doge1.trezor.io/api/v2/address/${address}`, {
+                timeout: 10000
+            });
+            const data = response.data;
+
+            if (data && typeof data.balance === 'string') {
+                const balanceSatoshis = parseInt(data.balance);
+                const unconfirmedSatoshis = parseInt(data.unconfirmedBalance || '0');
+                const balance = balanceSatoshis / 100000000; // Convert to DOGE
+                const unconfirmed = unconfirmedSatoshis / 100000000;
+                
+                console.log('Trezor Blockbook balance:', balance, 'confirmed,', unconfirmed, 'unconfirmed');
+                return {
+                    confirmed: balance,
+                    unconfirmed: unconfirmed,
+                    total: balance + unconfirmed
+                };
+            } else {
+                throw new Error('Trezor API returned invalid data');
+            }
+        } catch (trezorError) {
+            console.warn('Trezor Blockbook API failed, trying BlockCypher:', trezorError.message);
+
+        try {
+            // Try BlockCypher API first (more reliable than dogechain.info)
+            console.log('Trying BlockCypher API for balance...');
+            const response = await axios.get(`https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`, {
+                timeout: 10000 // 10 second timeout
+            });
+            const data = response.data;
+
+            // Check for API limits or errors
+            if (data && data.error) {
+                console.warn('BlockCypher API error:', data.error);
+                throw new Error(`API Error: ${data.error}`);
+            }
+
+            if (data && typeof data.balance === 'number') {
+                const balance = data.balance / 100000000; // Convert satoshis to DOGE
+                const unconfirmed = (data.unconfirmed_balance || 0) / 100000000;
+                console.log('BlockCypher balance:', balance, 'confirmed,', unconfirmed, 'unconfirmed');
+                return {
+                    confirmed: balance,
+                    unconfirmed: unconfirmed,
+                    total: balance + unconfirmed
+                };
+            } else {
+                throw new Error('BlockCypher API returned invalid data');
+            }
+        } catch (httpError) {
+            console.warn('BlockCypher API failed (likely rate limited), trying DogeChain.info:', httpError.message);
+
+            // Try DogeChain.info API as second option
+            try {
+                console.log('Trying DogeChain.info API for balance...');
+                const response = await axios.get(`https://dogechain.info/api/v1/address/balance/${address}`, {
+                    timeout: 10000
+                });
+                const data = response.data;
+
+                if (data && typeof data.balance === 'number') {
+                    const balance = data.balance; // DogeChain returns balance in DOGE
+                    console.log('DogeChain.info balance:', balance, 'DOGE');
+                    return {
+                        confirmed: balance,
+                        unconfirmed: 0, // DogeChain doesn't provide unconfirmed separately
+                        total: balance
+                    };
+                } else {
+                    throw new Error('DogeChain.info API returned invalid data');
+                }
+            } catch (dogeChainError) {
+                console.warn('DogeChain.info API also failed, trying Electrum:', dogeChainError.message);
+
+            // Fallback to Electrum with correct method names
+            try {
+                // Use the correct Electrum method for Dogecoin
+                const balance = await this.electrumClient.blockchainAddress_getBalance(address);
+
+                return {
+                    confirmed: balance.confirmed / 100000000, // Convert satoshis to DOGE
+                    unconfirmed: balance.unconfirmed / 100000000,
+                    total: (balance.confirmed + balance.unconfirmed) / 100000000
+                };
+            } catch (electrumError) {
+                console.warn('Electrum direct method failed, trying script hash method:', electrumError.message);
+
+                try {
+                    // Try with script hash method
+                    const scriptHash = this.addressToScriptHash(address);
+                    const balance = await this.electrumClient.blockchainScriptHash_getBalance(scriptHash);
+
+                    return {
+                        confirmed: balance.confirmed / 100000000,
+                        unconfirmed: balance.unconfirmed / 100000000,
+                        total: (balance.confirmed + balance.unconfirmed) / 100000000
+                    };
+                } catch (scriptError) {
+                    console.warn('Script hash method also failed:', scriptError.message);
+
+                    // Last resort: try to get UTXOs and calculate balance manually
+                    try {
+                        console.log('Trying UTXO-based balance calculation...');
+                        const scriptHash = this.addressToScriptHash(address);
+                        const utxos = await this.electrumClient.blockchain_scripthash_listunspent(scriptHash);
+                        const totalSatoshis = utxos.reduce((sum: number, utxo: any) => sum + utxo.value, 0);
+
+                        console.log('Calculated balance from UTXOs:', totalSatoshis / 100000000, 'DOGE');
+                        return {
+                            confirmed: totalSatoshis / 100000000,
+                            unconfirmed: 0,
+                            total: totalSatoshis / 100000000
+                        };
+                    } catch (utxoError) {
+                        console.warn('UTXO balance calculation failed:', utxoError.message);
+                        
+                        // Return zero balance rather than throwing
+                        console.log('All balance methods failed, returning zero balance');
+                        return {
+                            confirmed: 0,
+                            unconfirmed: 0,
+                            total: 0
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    private async fetchBalanceFromEndpoint(endpoint: APIEndpoint, address: string): Promise<WalletBalance> {
+        switch (endpoint.name) {
+            case 'Trezor Blockbook':
+                return await this.getBalanceFromTrezor(address);
+            case 'BlockCypher':
+                return await this.getBalanceFromBlockCypher(address);
+            case 'DogeChain.info':
+                return await this.getBalanceFromDogeChain(address);
+            default:
+                throw new Error(`Unknown endpoint: ${endpoint.name}`);
+        }
+    }
+
+    private async getBalanceFromTrezor(address: string): Promise<WalletBalance> {
+        const response = await axios.get(`https://doge1.trezor.io/api/v2/address/${address}`, {
+            timeout: 10000
+        });
+
+        if (response.data && typeof response.data.balance === 'string') {
+            const balanceSatoshis = parseInt(response.data.balance);
+            const unconfirmedSatoshis = parseInt(response.data.unconfirmedBalance || '0');
+            return {
+                confirmed: balanceSatoshis / 100000000,
+                unconfirmed: unconfirmedSatoshis / 100000000,
+                total: (balanceSatoshis + unconfirmedSatoshis) / 100000000
+            };
+        }
+        throw new Error('Invalid Trezor API response');
+    }
+
+    private async getBalanceFromBlockCypher(address: string): Promise<WalletBalance> {
+        const response = await axios.get(`https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`, {
+            timeout: 10000
+        });
+
+        if (response.data && response.data.error) {
+            throw new Error(`BlockCypher API error: ${response.data.error}`);
+        }
+
+        if (response.data && typeof response.data.balance === 'number') {
+            return {
+                confirmed: response.data.balance / 100000000,
+                unconfirmed: (response.data.unconfirmed_balance || 0) / 100000000,
+                total: (response.data.balance + (response.data.unconfirmed_balance || 0)) / 100000000
+            };
+        }
+        throw new Error('Invalid BlockCypher API response');
+    }
+
+    private async getBalanceFromDogeChain(address: string): Promise<WalletBalance> {
+        const response = await axios.get(`https://dogechain.info/api/v1/address/balance/${address}`, {
+            timeout: 10000
+        });
+
+        if (response.data && typeof response.data.balance === 'number') {
+            const balance = response.data.balance;
+            return {
+                confirmed: balance,
+                unconfirmed: 0,
+                total: balance
+            };
+        }
+        throw new Error('Invalid DogeChain API response');
+    }
+
+    private async getBalanceFromElectrum(address: string): Promise<WalletBalance> {
+        try {
+            // Try direct address method
+            const balance = await this.electrumClient.blockchainAddress_getBalance(address);
+            return {
+                confirmed: balance.confirmed / 100000000,
+                unconfirmed: balance.unconfirmed / 100000000,
+                total: (balance.confirmed + balance.unconfirmed) / 100000000
+            };
+        } catch (error) {
+            // Try script hash method
+            const scriptHash = this.addressToScriptHash(address);
+            const balance = await this.electrumClient.blockchainScriptHash_getBalance(scriptHash);
+            return {
+                confirmed: balance.confirmed / 100000000,
+                unconfirmed: balance.unconfirmed / 100000000,
+                total: (balance.confirmed + balance.unconfirmed) / 100000000
+            };
+        }
+    }
+
+    // Health check method for monitoring API status
+    async getAPIHealthStatus(): Promise<{ [key: string]: { healthy: boolean; lastSuccess: number; failures: number } }> {
+        const status: { [key: string]: { healthy: boolean; lastSuccess: number; failures: number } } = {};
+
+        for (const endpoint of this.apiEndpoints) {
+            const breaker = this.circuitBreakers[endpoint.name];
+            status[endpoint.name] = {
+                healthy: endpoint.isHealthy && breaker.state !== 'OPEN',
+                lastSuccess: endpoint.lastSuccess,
+                failures: breaker.failures
+            };
+        }
+
+        return status;
+    }
+
+    // Create a new wallet with seed phrase
+    async createNewWallet(): Promise<{ seed: string; addresses: WalletAddress[] }> {
+        try {
+            // Generate a new 12-word seed phrase
+            const seed = this.generateSeedPhrase();
+            this.walletSeed = seed;
+
+            // Generate initial addresses from seed
+            const addresses = await this.generateAddressesFromSeed(seed, 5); // Generate 5 addresses
+            this.walletAddresses = addresses;
+
+            return {
+                seed,
+                addresses
+            };
+        } catch (error: any) {
+            throw new Error(`Failed to create new wallet: ${error.message}`);
+        }
+    }
+
+    // Import wallet from seed phrase
+    async importWalletFromSeed(seed: string): Promise<WalletAddress[]> {
+        try {
+            if (!this.validateSeedPhrase(seed)) {
+                throw new Error('Invalid seed phrase');
+            }
+
+            this.walletSeed = seed;
+            const addresses = await this.generateAddressesFromSeed(seed, 10);
+            this.walletAddresses = addresses;
+
+            return addresses;
+        } catch (error: any) {
+            throw new Error(`Failed to import wallet: ${error.message}`);
+        }
+    }
+
+    // Generate new receiving address
+    async generateNewAddress(): Promise<WalletAddress> {
+        if (!this.walletSeed) {
+            throw new Error('No wallet loaded. Create or import a wallet first.');
+        }
+
+        const addressIndex = this.walletAddresses.length;
+        const newAddress = await this.deriveAddressFromSeed(this.walletSeed, addressIndex);
+        this.walletAddresses.push(newAddress);
+
+        return newAddress;
+    }
+
+    private generateSeedPhrase(): string {
+        // Use BIP39 for proper seed generation
+        const entropy = crypto.randomBytes(16); // 128 bits for 12-word seed
+        return bip39.entropyToMnemonic(entropy);
+    }
+
+    private validateSeedPhrase(seed: string): boolean {
+        try {
+            // Validate that it's a proper BIP39 mnemonic
+            bip39.mnemonicToEntropy(seed);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private async generateAddressesFromSeed(seed: string, count: number): Promise<WalletAddress[]> {
+        const addresses: WalletAddress[] = [];
+        
+        for (let i = 0; i < count; i++) {
+            const address = await this.deriveAddressFromSeed(seed, i);
+            addresses.push(address);
+        }
+
+        return addresses;
+    }
+
+    private async deriveAddressFromSeed(seed: string, index: number): Promise<WalletAddress> {
+        // Use proper BIP44 derivation for Dogecoin
+        const seedBuffer = await bip39.mnemonicToSeed(seed);
+        const root = bip32Factory.fromSeed(seedBuffer, this.network);
+        const account = root.derivePath(`m/44'/3'/0'`); // Dogecoin BIP44 path
+        const addressNode = account.derive(0).derive(index); // m/44'/3'/0'/0/index
+
+        const { address } = bitcoin.payments.p2pkh({
+            pubkey: Buffer.from(addressNode.publicKey),
+            network: this.network
+        });
+
+        if (!address) {
+            throw new Error('Failed to generate address');
+        }
+
+        // Store private key for signing (in production, this should be encrypted)
+        this.privateKeys = this.privateKeys || {};
+        this.privateKeys[address] = addressNode.toWIF();
+
+        // Get balance for this address if connected
+        let balance: WalletBalance = { confirmed: 0, unconfirmed: 0, total: 0 };
+        if (this.isConnected) {
+            try {
+                balance = await this.getBalance(address);
+            } catch (error) {
+                // If balance check fails, use zero balance
+            }
+        }
+
+        return {
+            address,
+            balance,
+            isUsed: balance.total > 0,
+            derivationPath: `m/44'/3'/0'/0/${index}` // Dogecoin derivation path
+        };
+    }
+
+
+
+    async connect(config: WalletConfig): Promise<void> {
+        try {
+            this.electrumUrl = config.electrumServer || 'electrum1.cipig.net';
+            this.electrumPort = config.port || 10061;
+
+            // Create TCP connection to Electrum server
+            this.electrumClient = new ElectrumClient(
+                this.electrumPort,
+                this.electrumUrl,
+                'tcp'
+            );
+
+            // Connect to the server
+            await this.electrumClient.connect();
+
+            // Test connection with server version
+            const version = await this.electrumClient.server_version('DoginalWallet', '1.4');
+            console.log('Connected to Electrum server:', version);
+
+            this.isConnected = true;
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            throw new Error(`Failed to connect to Electrum server: ${errorMessage}`);
+        }
+    }
+
+    async getBalance(address: string): Promise<WalletBalance> {
+        if (!this.isConnected || !this.electrumClient) {
+            throw new Error('Wallet not connected');
+        }
+
+        try {
+            // Try Trezor Blockbook API first (very reliable)
+            console.log('Trying Trezor Blockbook API for balance...');
+            const response = await axios.get(`https://doge1.trezor.io/api/v2/address/${address}`, {
+                timeout: 10000
+            });
+            const data = response.data;
+
+            if (data && typeof data.balance === 'string') {
+                const balanceSatoshis = parseInt(data.balance);
+                const unconfirmedSatoshis = parseInt(data.unconfirmedBalance || '0');
+                const balance = balanceSatoshis / 100000000; // Convert to DOGE
+                const unconfirmed = unconfirmedSatoshis / 100000000;
+                
+                console.log('Trezor Blockbook balance:', balance, 'confirmed,', unconfirmed, 'unconfirmed');
+                return {
+                    confirmed: balance,
+                    unconfirmed: unconfirmed,
+                    total: balance + unconfirmed
+                };
+            } else {
+                throw new Error('Trezor API returned invalid data');
+            }
+        } catch (trezorError) {
+            console.warn('Trezor Blockbook API failed, trying BlockCypher:', trezorError.message);
+
+        try {
+            // Try BlockCypher API first (more reliable than dogechain.info)
+            console.log('Trying BlockCypher API for balance...');
+            const response = await axios.get(`https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`, {
+                timeout: 10000 // 10 second timeout
+            });
+            const data = response.data;
+
+            // Check for API limits or errors
+            if (data && data.error) {
+                console.warn('BlockCypher API error:', data.error);
+                throw new Error(`API Error: ${data.error}`);
+            }
+
+            if (data && typeof data.balance === 'number') {
+                const balance = data.balance / 100000000; // Convert satoshis to DOGE
+                const unconfirmed = (data.unconfirmed_balance || 0) / 100000000;
+                console.log('BlockCypher balance:', balance, 'confirmed,', unconfirmed, 'unconfirmed');
+                return {
+                    confirmed: balance,
+                    unconfirmed: unconfirmed,
+                    total: balance + unconfirmed
+                };
+            } else {
+                throw new Error('BlockCypher API returned invalid data');
+            }
+        } catch (httpError) {
+            console.warn('BlockCypher API failed (likely rate limited), trying DogeChain.info:', httpError.message);
+
+            // Try DogeChain.info API as second option
+            try {
+                console.log('Trying DogeChain.info API for balance...');
+                const response = await axios.get(`https://dogechain.info/api/v1/address/balance/${address}`, {
+                    timeout: 10000
+                });
+                const data = response.data;
+
+                if (data && typeof data.balance === 'number') {
+                    const balance = data.balance; // DogeChain returns balance in DOGE
+                    console.log('DogeChain.info balance:', balance, 'DOGE');
+                    return {
+                        confirmed: balance,
+                        unconfirmed: 0, // DogeChain doesn't provide unconfirmed separately
+                        total: balance
+                    };
+                } else {
+                    throw new Error('DogeChain.info API returned invalid data');
+                }
+            } catch (dogeChainError) {
+                console.warn('DogeChain.info API also failed, trying Electrum:', dogeChainError.message);
+
+            // Fallback to Electrum with correct method names
+            try {
+                // Use the correct Electrum method for Dogecoin
+                const balance = await this.electrumClient.blockchainAddress_getBalance(address);
+
+                return {
+                    confirmed: balance.confirmed / 100000000, // Convert satoshis to DOGE
+                    unconfirmed: balance.unconfirmed / 100000000,
+                    total: (balance.confirmed + balance.unconfirmed) / 100000000
+                };
+            } catch (electrumError) {
+                console.warn('Electrum direct method failed, trying script hash method:', electrumError.message);
+
+                try {
+                    // Try with script hash method
+                    const scriptHash = this.addressToScriptHash(address);
+                    const balance = await this.electrumClient.blockchainScriptHash_getBalance(scriptHash);
+
+                    return {
+                        confirmed: balance.confirmed / 100000000,
+                        unconfirmed: balance.unconfirmed / 100000000,
+                        total: (balance.confirmed + balance.unconfirmed) / 100000000
+                    };
+                } catch (scriptError) {
+                    console.warn('Script hash method also failed:', scriptError.message);
+
+                    // Last resort: try to get UTXOs and calculate balance manually
+                    try {
+                        console.log('Trying UTXO-based balance calculation...');
+                        const scriptHash = this.addressToScriptHash(address);
+                        const utxos = await this.electrumClient.blockchain_scripthash_listunspent(scriptHash);
+                        const totalSatoshis = utxos.reduce((sum: number, utxo: any) => sum + utxo.value, 0);
+
+                        console.log('Calculated balance from UTXOs:', totalSatoshis / 100000000, 'DOGE');
+                        return {
+                            confirmed: totalSatoshis / 100000000,
+                            unconfirmed: 0,
+                            total: totalSatoshis / 100000000
+                        };
+                    } catch (utxoError) {
+                        console.warn('UTXO balance calculation failed:', utxoError.message);
+                        
+                        // Return zero balance rather than throwing
+                        console.log('All balance methods failed, returning zero balance');
+                        return {
+                            confirmed: 0,
+                            unconfirmed: 0,
+                            total: 0
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    async getAddresses(): Promise<WalletAddress[]> {
+        if (this.walletAddresses.length === 0) {
+            throw new Error('No wallet loaded. Create or import a wallet first.');
+        }
+
+        // Update balances for all addresses if connected
+        if (this.isConnected) {
+            const updatedAddresses: WalletAddress[] = [];
+            
+            for (const address of this.walletAddresses) {
+                try {
+                    const balance = await this.getBalance(address.address);
+                    updatedAddresses.push({
+                        ...address,
+                        balance,
+                        isUsed: balance.total > 0
+                    });
+                } catch (error) {
+                    // If balance check fails, keep original address info
+                    updatedAddresses.push(address);
+                }
+            }
+            
+            this.walletAddresses = updatedAddresses;
+        }
+
+        return this.walletAddresses;
+    }
+
+    async getUTXOs(address: string): Promise<any[]> {
+        if (!this.isConnected || !this.electrumClient) {
+            throw new Error('Wallet not connected');
+        }
+
+        try {
+            // Try different method names for getting UTXOs
+            let utxos;
+
+            try {
+                // Try blockchain_scripthash_listunspent first
+                const scriptHash = this.addressToScriptHash(address);
+                utxos = await this.electrumClient.blockchain_scripthash_listunspent(scriptHash);
+            } catch (e) {
+                try {
+                    // Try blockchain_address_listunspent as fallback
+                    utxos = await this.electrumClient.blockchain_address_listunspent(address);
+                } catch (e2) {
+                    // Try blockchain_utxo_get as last resort
+                    try {
+                        const scriptHash = this.addressToScriptHash(address);
+                        const utxoList = await this.electrumClient.blockchain_scripthash_get_utxos(scriptHash);
+                        utxos = utxoList || [];
+                    } catch (e3) {
+                        utxos = [];
+                    }
+                }
+            }
+
+            return utxos.map((utxo: any) => ({
+                txid: utxo.tx_hash || utxo.txid,
+                vout: utxo.tx_pos || utxo.vout,
+                value: utxo.value,
+                height: utxo.height
+            }));
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            throw new Error(`Failed to get UTXOs: ${errorMessage}`);
+        }
+    }
+
+    // New persistent UTXO detection method
+    async getUTXOsPersistent(options: {
+        onProgress?: (message: string) => void;
+        onBalanceUpdate?: (balance: number, addresses: string[]) => void;
+        maxRetries?: number;
+        retryDelays?: number[];
+        checkAllAddresses?: boolean;
+    } = {}): Promise<{ utxos: any[], address: string }> {
+        const {
+            onProgress,
+            onBalanceUpdate,
+            maxRetries = 20,
+            retryDelays = [5000, 10000, 30000, 60000], // 5s, 10s, 30s, 60s
+            checkAllAddresses = true
+        } = options;
+
+        let retryCount = 0;
+        let allAddresses: string[] = [];
+
+        // Get all wallet addresses if checking all
+        if (checkAllAddresses) {
+            try {
+                const walletAddresses = await this.getAddresses();
+                allAddresses = walletAddresses.map(addr => addr.address);
+                onProgress?.(`🔍 Checking ${allAddresses.length} wallet addresses for UTXOs...`);
+            } catch (error) {
+                onProgress?.('⚠️ Could not get wallet addresses, checking current address only');
+                allAddresses = [this.walletAddresses[0]?.address || ''];
+            }
+        } else {
+            allAddresses = [this.walletAddresses[0]?.address || ''];
+        }
+
+        while (retryCount < maxRetries) {
+            try {
+                // Check all addresses for UTXOs
+                for (const address of allAddresses) {
+                    if (!address) continue;
+
+                    onProgress?.(`🔄 Checking address: ${address.substring(0, 10)}...`);
+
+                    const utxos = await this.getUTXOs(address);
+
+                    if (utxos.length > 0) {
+                        onProgress?.(`✅ Found ${utxos.length} UTXO(s) on address: ${address.substring(0, 10)}...`);
+                        return { utxos, address };
+                    }
+                }
+
+                // No UTXOs found on any address
+                retryCount++;
+
+                if (retryCount >= maxRetries) {
+                    throw new Error(`No UTXOs found after ${maxRetries} attempts. Please send DOGE to one of your wallet addresses.`);
+                }
+
+                // Update balance information
+                if (onBalanceUpdate) {
+                    try {
+                        let totalBalance = 0;
+                        const addressBalances: string[] = [];
+
+                        for (const address of allAddresses) {
+                            if (!address) continue;
+                            const balance = await this.getBalance(address);
+                            totalBalance += balance.confirmed;
+                            if (balance.confirmed > 0) {
+                                addressBalances.push(`${address.substring(0, 10)}...: ${balance.confirmed} DOGE`);
+                            }
+                        }
+
+                        onBalanceUpdate(totalBalance, addressBalances);
+                    } catch (balanceError) {
+                        onProgress?.('⚠️ Could not check balance');
+                    }
+                }
+
+                // Calculate delay for next retry
+                const delayIndex = Math.min(retryCount - 1, retryDelays.length - 1);
+                const delay = retryDelays[delayIndex];
+
+                onProgress?.(`⏳ No UTXOs found. Retrying in ${delay / 1000} seconds... (${retryCount}/${maxRetries})`);
+                onProgress?.(`💰 Send DOGE to any of these addresses to continue:`);
+                allAddresses.forEach(addr => {
+                    if (addr) onProgress?.(`   ${addr}`);
+                });
+
+                // Wait before next retry
+                await new Promise(resolve => setTimeout(resolve, delay));
+
+            } catch (error) {
+                if (error instanceof Error && error.message.includes('No UTXOs found after')) {
+                    throw error; // Re-throw our custom error
+                }
+
+                retryCount++;
+                const delayIndex = Math.min(retryCount - 1, retryDelays.length - 1);
+                const delay = retryDelays[delayIndex];
+
+                onProgress?.(`❌ Error checking UTXOs: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                onProgress?.(`⏳ Retrying in ${delay / 1000} seconds... (${retryCount}/${maxRetries})`);
+
+                if (retryCount >= maxRetries) {
+                    throw new Error(`Failed to get UTXOs after ${maxRetries} attempts: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+
+        throw new Error('Maximum retries exceeded');
+    }
+
+    async getTransactionHex(txid: string): Promise<string> {
+        if (!this.isConnected || !this.electrumClient) {
+            throw new Error('Wallet not connected');
+        }
+
+        try {
+            // Try different method names for getting transaction hex
+            let txHex;
+
+            try {
+                txHex = await this.electrumClient.blockchainTransaction_get(txid);
+            } catch (e) {
+                try {
+                    txHex = await this.electrumClient.blockchain_transaction_get(txid);
+                } catch (e2) {
+                    txHex = await this.electrumClient.getTransaction(txid);
+                }
+            }
+
+            return txHex;
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            throw new Error(`Failed to get transaction hex: ${errorMessage}`);
+        }
+    }
+
+    async createTransaction(inputs: any[], outputs: any[], privateKeys: string[]): Promise<string> {
+        // Use modern bitcoinjs-lib API
+        const psbt = new bitcoin.Psbt({ network: this.network });
+
+        // Add inputs
+        for (let i = 0; i < inputs.length; i++) {
+            const input = inputs[i];
+            psbt.addInput({
+                hash: input.txid,
+                index: input.vout,
+                nonWitnessUtxo: Buffer.from(input.txHex, 'hex')
+            });
+        }
+
+        // Add outputs
+        outputs.forEach(output => {
+            if (output.script) {
+                // Handle script-based outputs (for inscriptions)
+                psbt.addOutput({
+                    script: Buffer.from(output.script, 'hex'),
+                    value: Math.floor(output.value * 100000000) // Convert DOGE to satoshis
+                });
+            } else {
+                // Handle address-based outputs
+                psbt.addOutput({
+                    address: output.address,
+                    value: Math.floor(output.value * 100000000) // Convert DOGE to satoshis
+                });
+            }
+        });
+
+        // Sign inputs
+        inputs.forEach((input, index) => {
+            const privateKey = privateKeys[index] || this.privateKeys[input.address];
+            if (privateKey) {
+                const keyPair = ECPair.fromWIF(privateKey, this.network);
+                psbt.signInput(index, keyPair);
+            } else {
+                throw new Error(`No private key available for input ${index}`);
+            }
+        });
+
+        psbt.finalizeAllInputs();
+        return psbt.extractTransaction().toHex();
+    }
+
+    async broadcastTransaction(txHex: string): Promise<string> {
+        if (!this.isConnected || !this.electrumClient) {
+            throw new Error('Wallet not connected');
+        }
+
+        try {
+            // Try different method names for broadcasting
+            let txid;
+
+            try {
+                txid = await this.electrumClient.blockchainTransaction_broadcast(txHex);
+            } catch (e) {
+                try {
+                    txid = await this.electrumClient.blockchain_transaction_broadcast(txHex);
+                } catch (e2) {
+                    txid = await this.electrumClient.broadcastTransaction(txHex);
+                }
+            }
+
+            return txid;
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            throw new Error(`Failed to broadcast transaction: ${errorMessage}`);
+        }
+    }
+
+    async estimateFee(inputCount: number, outputCount: number, feeRate: number = 500000): Promise<number> {
+        // Estimate transaction size (in bytes)
+        const estimatedSize = (inputCount * 148) + (outputCount * 34) + 10;
+        // Return fee in DOGE
+        return (estimatedSize * feeRate) / 100000000;
+    }
+
+    async getPrivateKeyForAddress(address: string): Promise<string | null> {
+        return this.privateKeys[address] || null;
+    }
+
+    private addressToScriptHash(address: string): string {
+        try {
+            const decoded = bitcoin.address.toOutputScript(address, this.network);
+            const hash = crypto.createHash('sha256').update(decoded).digest();
+            return hash.reverse().toString('hex');
+        } catch (error) {
+            throw new Error(`Invalid address: ${address}`);
+        }
+    }
+
+
+
+    disconnect(): void {
+        if (this.electrumClient) {
+            try {
+                this.electrumClient.close();
+            } catch (error) {
+                console.warn('Error closing Electrum connection:', error);
+            }
+            this.electrumClient = null;
+        }
+        this.isConnected = false;
+        this.electrumUrl = '';
+    }
+}
